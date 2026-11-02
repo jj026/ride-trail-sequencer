@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# outputs and downloaded map data
+*-map.png
+*.osm.json
+
+# keep personal ride tracks out of the repo
+*.gpx
+*.fit
+*.csv
