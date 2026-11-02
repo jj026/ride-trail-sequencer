@@ -4,7 +4,8 @@
 Give it a recorded ride: a GPX file from Garmin, Strava, Wahoo, an Apple Watch export
 app and so on, or a CSV with latitude/longitude columns. It downloads the trail network
 around the ride from OpenStreetMap, works out the ordered list of trails you rode,
-prints it, and draws a numbered map with an elevation profile.
+prints it, draws a numbered map with an elevation profile, and writes a Markdown report
+with distance, climbing, speed and heart rate (when the file has it) for every trail.
 
     python ride_recap.py my-ride.gpx
     python ride_recap.py my-ride.gpx --title "Tiger Mountain 11/8"
@@ -25,8 +26,9 @@ import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
-__version__ = "0.1.0"
-USER_AGENT = "ride-trail-sequencer/%s (+https://github.com/jj026/ride-trail-sequencer)" % __version__
+__version__ = "0.2.0"
+REPO_URL = "https://github.com/jj026/ride-trail-sequencer"
+USER_AGENT = "ride-trail-sequencer/%s (+%s)" % (__version__, REPO_URL)
 OVERPASS_SERVERS = (
     "https://overpass-api.de/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
@@ -34,6 +36,7 @@ OVERPASS_SERVERS = (
 )
 FT_PER_M = 3.280839895
 M_PER_MI = 1609.344
+MPS_TO_MPH = 3600.0 / M_PER_MI
 STALE_DAYS = 14
 MAX_SPAN_DEG = 0.4  # refuse rides spanning more than ~40 km; be gentle with the free servers
 
@@ -47,6 +50,10 @@ RATINGS = {  # OSM mtb:scale:imba -> (label, colour)
     "3": ("black", "#111111"), "4": ("double black", "#111111"),
 }
 KIND_STYLE = {"trail": ("unrated", "#757575"), "road": ("road", "#8d6e63"), "street": ("street", "#a1887f")}
+RATING_ICON = {"green": "\U0001F7E2", "blue": "\U0001F535", "black": "\u26AB", "double black": "\u26AB\u26AB",
+               "unrated": "\u26AA", "road": "\U0001F7E4", "street": "\U0001F7E4"}
+HR_TAGS = ("hr", "heartrate", "heart_rate")  # GPX extension tags, e.g. <gpxtpx:hr>
+HR_COLUMNS = ("hr", "heart_rate", "heartrate", "heart rate", "bpm")
 GAP_LABEL = "[not on OpenStreetMap]"
 GAP_COLOUR = "#d81b60"
 TRACK_COLOUR = "#e53935"
@@ -69,6 +76,14 @@ def parse_time(text):
         return None
 
 
+def parse_hr(text):
+    try:
+        bpm = float(str(text).strip())
+    except (TypeError, ValueError):
+        return None
+    return bpm if 25 <= bpm <= 250 else None
+
+
 def local_time(t):
     return t.astimezone() if t is not None and t.tzinfo is not None else t
 
@@ -78,7 +93,7 @@ def _tag(el):
 
 
 def load_track(path):
-    """Return ([(lat, lon, elevation_m or None, datetime or None), ...], track name or None)."""
+    """Return ([(lat, lon, elevation_m, datetime, heart_rate), ...], track name); missing values are None."""
     ext = os.path.splitext(path)[1].lower()
     pts, name = [], None
     if ext == ".gpx":
@@ -91,7 +106,7 @@ def load_track(path):
                         name = ch.text.strip()
             if tag != "trkpt":
                 continue
-            ele = when = None
+            ele = when = bpm = None
             for ch in el:
                 if _tag(ch) == "ele" and ch.text:
                     try:
@@ -100,7 +115,11 @@ def load_track(path):
                         pass
                 elif _tag(ch) == "time":
                     when = parse_time(ch.text)
-            pts.append((float(el.get("lat")), float(el.get("lon")), ele, when))
+            for d in el.iter():  # heart rate lives in <extensions>, e.g. <gpxtpx:hr>
+                if _tag(d).lower() in HR_TAGS and d.text:
+                    bpm = parse_hr(d.text)
+                    break
+            pts.append((float(el.get("lat")), float(el.get("lon")), ele, when, bpm))
         if not pts and any(_tag(el) == "rtept" for el in root.iter()):
             sys.exit("This GPX is a planned route, not a recorded ride (it has no track points).")
     elif ext == ".csv":
@@ -117,7 +136,8 @@ def load_track(path):
                     alt = float(alt) if alt else None
                 except ValueError:
                     alt = None
-                pts.append((la, lo, alt, parse_time(r.get("timestamp") or r.get("time"))))
+                bpm = parse_hr(next((r[c] for c in HR_COLUMNS if r.get(c)), None))
+                pts.append((la, lo, alt, parse_time(r.get("timestamp") or r.get("time")), bpm))
     else:
         sys.exit("Unsupported file type %r. Give it a .gpx or .csv track." % ext)
 
@@ -471,6 +491,91 @@ def render(out_path, title, ctx):
     plt.close(fig)
 
 
+# ---------------------------------------------------------------- report
+
+def md_escape(text):
+    for ch in "\\`*_[]<>|":
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def write_report(path, map_path, ctx):
+    """Write a Markdown report: summary, map, and the trail-order table."""
+    legs = ctx["legs"]
+    have_time, have_hr, have_elev = ctx["have_time"], ctx["have_hr"], ctx["have_elev"]
+    dash = "\u2014"
+    try:
+        rel = os.path.relpath(os.path.abspath(map_path), os.path.dirname(os.path.abspath(path)))
+    except ValueError:  # map and report on different Windows drives
+        rel = os.path.abspath(map_path)
+
+    lines = ["# " + md_escape(ctx["title"]), ""]
+    if ctx["note"]:
+        lines += ["> " + line for line in ctx["note"].splitlines()] + [""]
+    lines += ["![Ride map](<%s>)" % rel.replace(os.sep, "/"), "", "| | |", "|---|---|"]
+    when = ctx["when"]
+    if when is not None:
+        stamp = "%s, %s %d, %d" % (when.strftime("%a"), when.strftime("%b"), when.day, when.year)
+        if have_time:
+            stamp += " \u00b7 %s\u2013%s" % (when.strftime("%H:%M"), ctx["end"].strftime("%H:%M"))
+        lines.append("| **When** | %s |" % stamp)
+    lines.append("| **Distance** | %.1f mi \u00b7 %d%% on named trails and roads |"
+                 % (ctx["miles"], ctx["named_pct"]))
+    if have_elev:
+        lines.append("| **Climbing** | +{:,.0f} / \u2212{:,.0f} ft |".format(ctx["gain_ft"], ctx["loss_ft"]))
+    if have_time:
+        lines.append("| **Time** | %s total \u00b7 %s moving |" % (hms(ctx["elapsed"]), hms(ctx["moved"])))
+        if ctx["mph"]:
+            lines.append("| **Moving speed** | %.1f mph average |" % ctx["mph"])
+    if have_hr:
+        lines.append("| **Heart rate** | avg %d \u00b7 max %d bpm |" % (round(ctx["hr_avg"]), round(ctx["hr_max"])))
+
+    def rating(leg):
+        if leg["gap"]:
+            return dash
+        return (RATING_ICON.get(leg["rating"], "") + " " + leg["rating"]).strip()
+
+    cols = [("#", "--:", lambda n, L: str(n)),
+            ("Trail", "---", lambda n, L: ("**%s**" if L["gap"] else "%s") % md_escape(L["label"])),
+            ("Rating", "---", lambda n, L: rating(L)),
+            ("mi", "--:", lambda n, L: "%.2f" % (L["dist"] / M_PER_MI))]
+    if have_time:
+        cols.append(("mph", "--:", lambda n, L: "%.1f" % L["mph"] if L["mph"] else dash))
+    if have_elev:
+        cols.append(("\u00b1ft", "---",
+                     lambda n, L: "+{:,.0f} / \u2212{:,.0f}".format(L["up_ft"], L["down_ft"])))
+    if have_time:
+        cols.append(("Time", "---", lambda n, L: "%s\u2013%s" % L["span"] if L["span"] else dash))
+    if have_hr:
+        cols.append(("HR avg / max", "---",
+                     lambda n, L: "%d / %d" % (round(L["hr"][0]), round(L["hr"][1])) if L["hr"] else dash))
+    if any(L["note"] for L in legs):
+        cols.append(("Note", "---", lambda n, L: L["note"]))
+    lines += ["", "## Trail order", "",
+              "| " + " | ".join(c[0] for c in cols) + " |",
+              "|" + "|".join(c[1] for c in cols) + "|"]
+    lines += ["| " + " | ".join(c[2](n, L) for c in cols) + " |" for n, L in enumerate(legs, 1)]
+    lines += ["", "**Sequence:** " + " \u2192 ".join(md_escape(L["label"]) for L in legs), "",
+              "## How to read this", ""]
+    if have_time:
+        lines.append("- **mph** is moving speed; time spent stopped doesn't count.")
+    if have_elev:
+        lines.append("- **Climbing** and **\u00b1ft** only count while moving, so altimeter drift during stops "
+                     "doesn't show up as climbing. They come from the device and are roughly \u00b15%.")
+    if have_hr:
+        lines.append("- **Heart rate** is what the device recorded, averaged over each trail.")
+    lines.append("- **Rating** is OpenStreetMap's `mtb:scale:imba` tag; *unrated* means nobody has tagged "
+                 "the trail yet.")
+    if any(L["gap"] for L in legs):
+        lines.append("- **%s** is a stretch with no trail on OpenStreetMap yet (dashed pink on the map)."
+                     % md_escape(GAP_LABEL))
+    lines += ["", "---", "",
+              "Made with [ride-trail-sequencer](%s) %s. Map data \u00a9 "
+              "[OpenStreetMap contributors](https://www.openstreetmap.org/copyright)." % (REPO_URL, __version__)]
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 # ---------------------------------------------------------------- main
 
 def main(argv=None):
@@ -485,7 +590,10 @@ def main(argv=None):
         epilog="Map data (c) OpenStreetMap contributors, ODbL. Keep the credit on anything you share.")
     ap.add_argument("track", help="recorded ride: .gpx, or .csv with latitude/longitude columns")
     ap.add_argument("--title", help="map title (default: the ride's name and date)")
-    ap.add_argument("--out", help="output PNG (default: <track>-map.png next to the track)")
+    ap.add_argument("--out", help="output map PNG (default: <track>-map.png next to the track)")
+    ap.add_argument("--report", help="output Markdown report (default: <track>-report.md next to the map)")
+    ap.add_argument("--no-report", action="store_true", help="don't write the Markdown report")
+    ap.add_argument("--note", help="text to put at the top of the report (Markdown allowed)")
     ap.add_argument("--refresh", action="store_true", help="re-download map data instead of using the cache")
     ap.add_argument("--no-trim", action="store_true",
                     help="keep the whole track; by default streets before the first trail and after the "
@@ -510,6 +618,8 @@ def main(argv=None):
     track, trk_name = load_track(a.track)
     out = a.out or os.path.splitext(a.track)[0] + "-map.png"
     cache = os.path.splitext(out)[0] + ".osm.json"
+    base = os.path.splitext(out)[0]
+    report = a.report or (base[:-4] if base.endswith("-map") else base) + "-report.md"
     lats = [p[0] for p in track]
     lons = [p[1] for p in track]
     if max(lats) - min(lats) > MAX_SPAN_DEG or max(lons) - min(lons) > MAX_SPAN_DEG:
@@ -562,6 +672,8 @@ def main(argv=None):
             if times[i] is not None and times[i - 1] is not None:
                 dt = (times[i] - times[i - 1]).total_seconds()
                 moving[i] = dt > 0 and step[i] / dt >= 0.5
+    hrs = [p[4] for p in track]
+    have_hr = any(h is not None for h in hrs[s0:s1 + 1])
 
     alts = [p[2] for p in track]
     have_elev = not a.no_profile and sum(1 for v in alts[s0:s1 + 1] if v is not None) >= (s1 - s0 + 1) // 2
@@ -614,6 +726,18 @@ def main(argv=None):
                     up += max(0.0, z[i] - z[i - 1])
                     down += max(0.0, z[i - 1] - z[i])
         leg["up_ft"], leg["down_ft"] = up * FT_PER_M, down * FT_PER_M
+        leg["mph"] = leg["span"] = None
+        if have_time:
+            dist_m = secs = 0.0
+            for i in range(leg["start"] + 1, leg["end"] + 1):
+                if moving[i]:
+                    dist_m += step[i]
+                    secs += (times[i] - times[i - 1]).total_seconds()
+            leg["mph"] = dist_m / secs * MPS_TO_MPH if secs > 0 else None
+            leg["span"] = (local_time(times[leg["start"]]).strftime("%H:%M"),
+                           local_time(times[leg["end"]]).strftime("%H:%M"))
+        vals = [hrs[i] for i in range(leg["start"], leg["end"] + 1) if hrs[i] is not None]
+        leg["hr"] = (sum(vals) / len(vals), max(vals)) if vals else None
 
     total = cum[s1] - cum[s0]
     on_map = sum(step[i] for i in range(s0 + 1, s1 + 1) if smooth[i] is not None)
@@ -627,28 +751,40 @@ def main(argv=None):
         title = trk_name or os.path.splitext(os.path.basename(a.track))[0]
         if when is not None:
             title += " - %s %d, %d" % (when.strftime("%b"), when.day, when.year)
+    elapsed = moved = 0.0
+    mph = None
+    if have_time:
+        elapsed = (times[s1] - times[s0]).total_seconds()
+        moved = sum((times[i] - times[i - 1]).total_seconds() for i in range(s0 + 1, s1 + 1) if moving[i])
+        moved_m = sum(step[i] for i in range(s0 + 1, s1 + 1) if moving[i])
+        mph = moved_m / moved * MPS_TO_MPH if moved > 0 else None
+    hr_vals = [h for h in hrs[s0:s1 + 1] if h is not None]
+    hr_avg = sum(hr_vals) / len(hr_vals) if hr_vals else None
+    hr_max = max(hr_vals) if hr_vals else None
+
     head = "%s: %.1f mi" % (title, total / M_PER_MI)
     if z is not None:
         head += ", +{:,.0f} ft".format(gain * FT_PER_M)
     if have_time:
-        elapsed = (times[s1] - times[s0]).total_seconds()
-        moved = sum((times[i] - times[i - 1]).total_seconds() for i in range(s0 + 1, s1 + 1) if moving[i])
-        head += ", %s (%s moving)" % (hms(elapsed), hms(moved))
+        head += ", %s (%s moving%s)" % (hms(elapsed), hms(moved), ", %.1f mph" % mph if mph else "")
 
     print()
     print(head)
     print("%d%% of the ride is on mapped paths and roads; %d%% is on named ones."
           % (round(100 * on_map / total), round(100 * on_named / total)))
+    if have_hr:
+        print("Heart rate: avg %d, max %d bpm." % (round(hr_avg), round(hr_max)))
     print()
-    print(" #  %-36s %-12s %6s  %-14s %-11s %s" % ("Trail", "Rating", "mi", "up/down ft", "Time", "Note"))
+    print(" #  %-36s %-12s %6s %5s  %-14s %-11s %-8s %s"
+          % ("Trail", "Rating", "mi", "mph", "up/down ft", "Time", "HR", "Note"))
     for n, leg in enumerate(legs, 1):
         updown = "+{:,.0f}/-{:,.0f}".format(leg["up_ft"], leg["down_ft"]) if z is not None else ""
-        span = ""
-        if have_time:
-            span = "%s-%s" % (local_time(times[leg["start"]]).strftime("%H:%M"),
-                              local_time(times[leg["end"]]).strftime("%H:%M"))
-        print("%2d  %-36s %-12s %6.2f  %-14s %-11s %s" % (n, leg["label"][:36], leg["rating"],
-                                                         leg["dist"] / M_PER_MI, updown, span, leg["note"]))
+        span = "%s-%s" % leg["span"] if leg["span"] else ""
+        speed = "%.1f" % leg["mph"] if leg["mph"] else ""
+        bpm = "%d/%d" % (round(leg["hr"][0]), round(leg["hr"][1])) if leg["hr"] else ""
+        print("%2d  %-36s %-12s %6.2f %5s  %-14s %-11s %-8s %s"
+              % (n, leg["label"][:36], leg["rating"], leg["dist"] / M_PER_MI, speed, updown, span, bpm,
+                 leg["note"]))
     print()
     print("Sequence: " + " -> ".join(leg["label"] for leg in legs))
     if any(leg["gap"] for leg in legs):
@@ -660,6 +796,14 @@ def main(argv=None):
         "proj": proj, "z": z, "cum": cum, "climbs": climbs,
         "gain_ft": gain * FT_PER_M, "loss_ft": loss * FT_PER_M})
     print("\nmap: %s" % os.path.abspath(out))
+    if not a.no_report:
+        write_report(report, out, {
+            "title": title, "note": a.note, "legs": legs, "when": when, "end": local_time(times[s1]),
+            "have_time": have_time, "have_hr": have_hr, "have_elev": z is not None,
+            "miles": total / M_PER_MI, "named_pct": round(100 * on_named / total),
+            "gain_ft": gain * FT_PER_M, "loss_ft": loss * FT_PER_M, "elapsed": elapsed, "moved": moved,
+            "mph": mph, "hr_avg": hr_avg, "hr_max": hr_max})
+        print("report: %s" % os.path.abspath(report))
 
 
 if __name__ == "__main__":

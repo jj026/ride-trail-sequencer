@@ -1,18 +1,16 @@
 # ride-trail-sequencer
 
 **Which trails did I ride, and in what order?** Give it a recorded mountain-bike ride (a GPX
-file) and it prints the ordered list of named trails you rode, then draws a numbered map with an
-elevation profile. Trail names, ratings and lines come from
-[OpenStreetMap](https://www.openstreetmap.org).
+file) and it prints the ordered list of named trails you rode, draws a numbered map with an
+elevation profile, and writes a report with distance, climbing, speed and heart rate for every
+trail. Trail names, ratings and lines come from [OpenStreetMap](https://www.openstreetmap.org).
 
-```
- #  Trail                     Rating     mi  up/down ft
- 3  Upward Mobility           green    2.91  +1,035/-12
- 4  Raging Ridge              blue     3.40  +1,131/-173
- 6  Return Policy             blue     1.35  +3/-469
- 7  Wild Waves                blue     2.38  +32/-1,245
-15  [not on OpenStreetMap]    -        0.76  +0/-398
-```
+**[See a sample report →](examples/sample-ride-report.md)**
+
+<img src="examples/sample-ride-map.png" alt="Sample output: a numbered trail map with an elevation profile" width="480">
+
+*Sample output from a made-up ride. For privacy, the rider, date, times, speed and heart rate are
+all invented; the trails are real.*
 
 ## What you need
 
@@ -30,28 +28,37 @@ elevation profile. Trail names, ratings and lines come from
   Health and export it there, or use a third-party export app.
 
 A CSV works too, if it has `latitude` and `longitude` columns (optionally `altitude` or
-`elevation`, and `timestamp` or `time`).
+`elevation`, `timestamp` or `time`, and `hr` or `heart_rate`).
 
 ## Run it
 
 Open a terminal in the unzipped folder (Windows: right-click inside the folder → **Open in
-Terminal**), then:
+Terminal**). Try it first on the made-up sample ride:
+
+```
+python ride_recap.py examples/sample-ride.gpx
+```
+
+Then on your own:
 
 ```
 python ride_recap.py my-ride.gpx
-python ride_recap.py my-ride.gpx --title "Tiger Mountain 11/8"
+python ride_recap.py my-ride.gpx --title "Tiger Mountain 11/8" --note "First ride on the new tires"
 ```
 
 Tip: instead of typing the GPX file's location, drag the file onto the terminal window.
 
-It prints the trail list and writes `my-ride-map.png` next to the GPX. The trail map it downloads is
-cached in `my-ride-map.osm.json`, so re-running is instant; add `--refresh` to download it again.
-`python ride_recap.py --help` lists every option.
+It prints the trail list and writes two files next to the GPX: `my-ride-map.png` and
+`my-ride-report.md`, which opens nicely in any Markdown viewer, or on GitHub. The trail map it
+downloads is cached in `my-ride-map.osm.json`, so re-running is instant; add `--refresh` to
+download it again. `python ride_recap.py --help` lists every option.
 
 ## Reading the output
 
 - **Rating** is OpenStreetMap's `mtb:scale:imba` tag: green, blue, black, double black. *unrated*
   means nobody has tagged the trail yet.
+- **mph** is moving speed: time spent stopped doesn't count.
+- **HR** is your average and maximum heart rate on each trail, if your device recorded it.
 - **`[not on OpenStreetMap]`**: you rode something the map doesn't have. It's drawn as a dashed pink
   line rather than silently left out, so you know there's a gap.
 - **`bikes not allowed, per OSM`**: the trail is tagged `bicycle=no`. The tag can be wrong, but check
@@ -80,10 +87,12 @@ Trailforks, Strava or other maps; their licenses don't allow it.
 
 - Your GPX stays on your computer. The only thing sent over the internet is the rectangle around your
   ride, to download the trail map.
+- **The report includes your heart rate and ride times.** Check it before you share it.
 - By default the map starts at the first trail or forest road you rode and ends at the last one, so
   the streets around where you started (often your home) aren't drawn. That won't help if you start on
   a forest road or a trail by your house; add `--hide-ends-m 500` to cut more.
   **Look at the map before you post it.**
+- The sample in [examples/](examples/) is made up. It isn't anyone's real health or location data.
 
 ## Using it with an AI coding agent
 

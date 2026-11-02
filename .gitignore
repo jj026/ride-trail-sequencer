@@ -3,9 +3,15 @@ __pycache__/
 
 # outputs and downloaded map data
 *-map.png
+*-report.md
 *.osm.json
 
 # keep personal ride tracks out of the repo
 *.gpx
 *.fit
 *.csv
+
+# ...except the made-up sample
+!examples/sample-ride.gpx
+!examples/sample-ride-map.png
+!examples/sample-ride-report.md
